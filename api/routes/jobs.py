@@ -58,9 +58,10 @@ def create_job(
 @router.get("/jobs/{run_id}")
 def get_job(
     run_id: str,
-    _user: dict[str, Any] = Depends(get_current_user),
+    user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     run = db.get_run(run_id)
-    if not run:
+    # 404 (not 403) for other users' jobs — don't leak run_id existence
+    if not run or (run.get("user_id") != user["sub"] and user.get("role") != "admin"):
         raise HTTPException(status_code=404, detail="Job not found")
     return run

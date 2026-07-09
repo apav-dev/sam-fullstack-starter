@@ -45,3 +45,11 @@ def test_job_lifecycle():
 
     assert client.get("/api/jobs/nope", headers=headers).status_code == 404
     assert client.get(f"/api/jobs/{run_id}").status_code == 401
+
+    # Another (non-admin) user must not see this job — 404, not the run data
+    r2 = client.post(
+        "/api/auth/signup",
+        json={"email": "b@c.com", "password": "password123", "name": "B"},
+    )
+    other = {"Authorization": f"Bearer {r2.json()['token']}"}
+    assert client.get(f"/api/jobs/{run_id}", headers=other).status_code == 404

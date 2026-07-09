@@ -21,10 +21,12 @@ from api.routes.uploads import router as uploads_router
 app = FastAPI(title="myapp API", docs_url=None, redoc_url=None)
 
 _origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")]
+# Auth uses Bearer headers, not cookies, so credentialed CORS is unnecessary
+# (and would be rejected by browsers when combined with a "*" origin).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

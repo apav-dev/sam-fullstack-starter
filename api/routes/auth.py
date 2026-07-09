@@ -71,6 +71,9 @@ def signup(req: SignupRequest) -> dict[str, Any]:
     if db.get_user_by_email(email):
         raise HTTPException(status_code=409, detail="An account with this email already exists")
 
+    # First signup becomes admin. Not atomic — two simultaneous first signups
+    # could both win. Acceptable for the deploy-then-immediately-sign-up flow;
+    # restrict signup domains (bootstrap.sh) if that window matters to you.
     role = "admin" if db.count_users() == 0 else "user"
     user = {
         "user_id": str(uuid.uuid4()),
