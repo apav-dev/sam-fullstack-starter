@@ -1,0 +1,9 @@
+# Lambda runtime dependencies (shipped in DepsLayer — see Makefile).
+# boto3 is provided by the Lambda runtime and stripped from the layer.
+fastapi>=0.115
+mangum>=0.19
+pydantic>=2.7
+email-validator>=2.1
+PyJWT>=2.8
+cryptography>=42.0
+python-multipart>=0.0.9

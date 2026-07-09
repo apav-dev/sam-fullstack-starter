@@ -1,0 +1,23 @@
+# SAM build staging
+lambda/
+.aws-sam/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/dist/
+playwright-report/
+test-results/
+
+# Local secrets / personal config
+.env
+.env.*
+
+# OS
+.DS_Store

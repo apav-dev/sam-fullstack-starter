@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: myapp — SPA on CloudFront + FastAPI Lambda + DynamoDB + S3 (SAM full-stack starter)
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, staging, dev, test]
+    Description: Deployment environment (namespaces every resource)
+
+  BedrockModel:
+    Type: String
+    Default: "us.amazon.nova-lite-v1:0"
+    Description: Amazon Bedrock model ID (cross-region inference profile or direct)
+
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    Description: HS256 secret for signing JWT auth tokens (sourced from SSM by deploy.sh)
+
+  AllowedSignupEmailDomains:
+    Type: String
+    Default: ""
+    Description: Comma-separated email domains allowed to self-register (empty = no restriction)
+
+  OktaIssuer:
+    Type: String
+    Default: ""
+    Description: >-
+      Okta authorization server issuer URL (e.g. https://client.okta.com/oauth2/default).
+      Leave empty to disable Okta SSO — email/password auth remains fully operational.
+
+  OktaClientId:
+    Type: String
+    Default: ""
+    Description: Okta OIDC public client ID for PKCE flow (not a secret). Required with OktaIssuer.
+
+  CustomDomainNames:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Comma-separated custom domain aliases for CloudFront (e.g. "app.example.com").
+      Leave empty to use the default *.cloudfront.net URL.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of the ACM certificate covering CustomDomainNames. MUST live in us-east-1
+      (CloudFront requirement). Required when CustomDomainNames is set.
+
+  AppVersion:
+    Type: String
+    Default: dev
+    Description: Human-readable app version (git tag) exposed at /api/health
+
+  GitSha:
+    Type: String
+    Default: unversioned
+    Description: Git commit SHA (+ -dirty suffix when uncommitted changes)
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Select [0, !Ref CustomDomainNames], ""]]
+
+# ── Globals ───────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        USERS_TABLE: !Ref UsersTable
+        RUNS_TABLE: !Ref RunsTable
+        DATA_BUCKET: !Ref DataBucket
+        BEDROCK_MODEL: !Ref BedrockModel
+        JWT_SECRET: !Ref JwtSecret
+        ALLOWED_SIGNUP_EMAIL_DOMAINS: !Ref AllowedSignupEmailDomains
+        OKTA_ISSUER: !Ref OktaIssuer
+        OKTA_CLIENT_ID: !Ref OktaClientId
+        # Mangum uses this to strip the API Gateway stage prefix from rawPath
+        STAGE: !Ref Environment
+        APP_VERSION: !Ref AppVersion
+        GIT_SHA: !Ref GitSha
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── DynamoDB ────────────────────────────────────────────────────────────────
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "myapp-users-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EmailIndex
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  RunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "myapp-runs-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+      # api/db.py stamps a `ttl` epoch on every run so finished jobs self-expire
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── S3: data (uploads + job outputs) ────────────────────────────────────────
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "myapp-data-${Environment}-${AWS::AccountId}"
+      # CORS lets the browser PUT directly to presigned URLs
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ["*"]
+            AllowedMethods: [PUT, GET]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireUploads
+            Prefix: uploads/
+            Status: Enabled
+            ExpirationInDays: 1
+          - Id: ExpireOutput
+            Prefix: output/
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ── S3: static frontend (private; CloudFront OAC is the only reader) ───────
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "myapp-frontend-${Environment}-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}"
+
+  # ── API Gateway HTTP API ─────────────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowHeaders: ["*"]
+        AllowMethods: ["*"]
+        MaxAge: 600
+
+  # ── Lambda Layer: Python dependencies ───────────────────────────────────────
+  DepsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "myapp-deps-${Environment}"
+      Description: Python deps (fastapi, mangum, pyjwt, ...)
+      ContentUri: lambda/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [x86_64]
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitectures: [x86_64]
+
+  # ── API Lambda (FastAPI + Mangum, 60 s) ─────────────────────────────────────
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitectures: [x86_64]
+    Properties:
+      FunctionName: !Sub "myapp-api-${Environment}"
+      Description: FastAPI handler — all HTTP routes
+      Handler: api.main.handler
+      CodeUri: lambda/
+      Timeout: 60
+      # Bump for heavier workloads; CPU scales with memory on Lambda.
+      MemorySize: 1024
+      Layers:
+        - !Ref DepsLayer
+      Environment:
+        Variables:
+          PROCESSOR_FUNCTION: !Ref ProcessorFunction
+          CORS_ORIGINS: "*"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref UsersTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RunsTable
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ProcessorFunction
+        - Statement:
+            # Foundation models + the cross-region inference profiles that front them.
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/*"
+                - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+      Events:
+        ApiProxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        ApiRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+        # Ping /api/health every 5 minutes to keep the Lambda warm (avoids
+        # cold-start latency on the first real request).
+        KeepWarm:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"httpMethod":"GET","path":"/api/health","requestContext":{},"headers":{},"queryStringParameters":null,"body":null,"isBase64Encoded":false}'
+
+  # ── Processor Lambda (async worker, up to 15 min) ────────────────────────────
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitectures: [x86_64]
+    Properties:
+      FunctionName: !Sub "myapp-processor-${Environment}"
+      Description: Async worker — invoked by ApiFunction with InvocationType=Event
+      Handler: api.processor.handler
+      CodeUri: lambda/
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        - !Ref DepsLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RunsTable
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucket
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource:
+                - "arn:aws:bedrock:*::foundation-model/*"
+                - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+
+  # ── CloudFront OAC (Origin Access Control for S3) ───────────────────────────
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "myapp-oac-${Environment}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ── CloudFront Distribution (single door: SPA + /api/*) ─────────────────────
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: !Sub "myapp (${Environment})"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Aliases: !If
+          - HasCustomDomain
+          - !Ref CustomDomainNames
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        Origins:
+          # S3 frontend (default origin)
+          - Id: S3Frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+
+          # API Gateway (for /api/* proxy)
+          - Id: ApiGateway
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              # 60 s is the CloudFront maximum for standard distributions —
+              # anything slower must go through the async worker pattern.
+              OriginReadTimeout: 60
+            OriginPath: !Sub "/${Environment}"
+
+        # Default: serve static assets from S3
+        DefaultCacheBehavior:
+          TargetOriginId: S3Frontend
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized managed policy
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+
+        # /api/* — forward to API Gateway, no caching
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiGateway
+            ViewerProtocolPolicy: https-only
+            # CachingDisabled managed policy
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AllViewerExceptHostHeader managed origin-request policy
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+        # SPA fallback — return index.html for 403/404 from S3
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+Outputs:
+  CloudFrontUrl:
+    Description: Public URL of the CloudFront distribution
+    Value: !Sub "https://${CloudFrontDistribution.DomainName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontUrl"
+
+  ApiUrl:
+    Description: API Gateway base URL
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiUrl"
+
+  FrontendBucketName:
+    Description: S3 bucket name for frontend static files
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendBucket"
+
+  DataBucketName:
+    Description: S3 bucket name for uploads and output files
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DataBucket"
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (needed for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
